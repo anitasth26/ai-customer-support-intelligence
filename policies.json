@@ -1,0 +1,27 @@
+[
+  {
+    "id": "POL-001",
+    "title": "Account Access and Login Issues",
+    "content": "\n        Employees who cannot access their company accounts\n        should first verify their login credentials.\n        If the account is locked or access is denied,\n        the ticket must be sent to the Identity and Access\n        Management team. Never request a user's password.\n        "
+  },
+  {
+    "id": "POL-002",
+    "title": "Data Loss and File Recovery",
+    "content": "\n        Accidental deletion of important company files\n        must be escalated to the IT Data Recovery team.\n        Employees should avoid modifying affected files\n        or storage locations until IT has assessed the issue.\n        "
+  },
+  {
+    "id": "POL-003",
+    "title": "Company-Wide System Outages",
+    "content": "\n        A company-wide outage preventing employees from\n        working is classified as critical and must be\n        escalated immediately to the IT Incident Response team.\n        "
+  },
+  {
+    "id": "POL-004",
+    "title": "Password Reset Requests",
+    "content": "\n        Standard password reset requests should use the\n        approved self-service password reset portal.\n        If self-service fails, the ticket must be reviewed\n        by the IT Helpdesk.\n        "
+  },
+  {
+    "id": "POL-005",
+    "title": "Suspicious Emails and Phishing",
+    "content": "\n        Employees who receive suspicious emails should\n        report them to the Security Operations team.\n        If a suspicious link was opened or credentials\n        were entered, the incident requires urgent review.\n        "
+  }
+]
