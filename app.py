@@ -24,7 +24,10 @@ SCHEMA = {
 SYSTEM = '''You are an IT support triage assistant for English and German tickets.
 Classify business impact, not urgency words. Return only the required JSON fields.
 critical: major outage, confirmed severe security incident, immediate threat to essential operations.
-high: serious operational problem needing prompt attention.
+high: serious operational problem needing prompt attention; suspected phishing or
+suspicious credential requests without confirmed compromise.
+Confirmed credential exposure is critical. Receiving a suspicious email without
+clicking or sharing credentials is high. Do not assume compromise without evidence.
 medium: important issue without immediate operational impact.
 low: minor issue or routine support request.
 very_low: non-urgent administrative or informational request.
@@ -100,9 +103,28 @@ def process_ticket(ticket, classifier):
         result = classifier(ticket)
         if not validate_result(result):
             return fallback('Response validation failed: AI output did not match the required schema.', safety)
-    except Exception:
-        # Never display/log raw exceptions, which may contain requests or secrets.
-        return fallback('Processing failed: service unavailable, timeout, quota, blocked output, or unreadable response.', safety)
+    except Exception as error:
+        # Report only allowlisted categories, never raw exception text or requests.
+        code = getattr(error, 'code', None)
+        if type(code) is not int:
+            code = None
+        details = {
+            400: 'Gemini rejected the request (400). Check the API key and model configuration.',
+            401: 'Gemini authentication failed (401). Check the API key in Streamlit Secrets.',
+            403: 'Gemini access denied (403). Check API key permissions and project access.',
+            404: 'Gemini model or endpoint not found (404). Check GEMINI_MODEL in Streamlit Secrets.',
+            429: 'Gemini quota or rate limit reached (429). Check the API project quota and billing.',
+            500: 'Gemini service error (500). Try again later.',
+            503: 'Gemini service unavailable (503). Try again later.',
+            504: 'Gemini request timed out (504). Try again later.',
+        }
+        if code in details:
+            detail = details[code]
+        elif isinstance(error, json.JSONDecodeError):
+            detail = 'Gemini returned an unreadable or empty JSON response.'
+        else:
+            detail = 'Service unavailable, connection failure, timeout, blocked output, or unreadable response.'
+        return fallback('Processing failed: ' + detail, safety)
     triggers = []
     if result['priority'] == 'critical':
         triggers.append('Critical incident: immediate human intervention is required.')
@@ -128,11 +150,74 @@ def classify_ticket(ticket, key, model):
         response = client.models.generate_content(
             model=model, contents=json.dumps(ticket, ensure_ascii=False),
             config=types.GenerateContentConfig(
-                system_instruction=SYSTEM, response_mime_type='application/json',
+                system_instruction=SYSTEM, temperature=0, response_mime_type='application/json',
                 response_json_schema=SCHEMA, max_output_tokens=1024,
             ),
         )
     return json.loads(response.text)
+
+
+def generate_policy_text(system, payload, key, model):
+    """One bounded Gemini request per policy stage; no implicit retries."""
+    with genai.Client(api_key=key, http_options=types.HttpOptions(
+            timeout=30000, retry_options=types.HttpRetryOptions(attempts=1))) as client:
+        response = client.models.generate_content(
+            model=model, contents=json.dumps(payload, ensure_ascii=False),
+            config=types.GenerateContentConfig(
+                system_instruction=system, temperature=0, max_output_tokens=1024,
+            ),
+        )
+    return response.text
+
+
+def run_policy_analysis(ticket, key, model):
+    # Import and model loading happen only after submission and valid classification.
+    from rag_pipeline import analyze_policy, load_resources
+    return analyze_policy(
+        ticket, lambda system, payload: generate_policy_text(system, payload, key, model),
+        load_resources(),
+    )
+
+
+def process_ticket_with_policy(ticket, classifier, policy_analyzer):
+    """Apply a verified policy before the existing safety and routing rules."""
+    from rag_pipeline import apply_policy_priority
+    policy_result = {
+        'policy_id': None, 'policy_title': None, 'recommendation': None,
+        'policy_status': 'not_run',
+    }
+
+    def classify_and_apply(value):
+        classification = classifier(value)
+        if not validate_result(classification):
+            return classification
+        try:
+            guidance = policy_analyzer(value)
+            if (not isinstance(guidance, dict)
+                    or guidance.get('policy_status') not in
+                    ('verified', 'no_match', 'unavailable')):
+                raise ValueError('Invalid policy analysis')
+            policy_result.update(guidance)
+        except Exception:
+            policy_result.update(
+                policy_status='unavailable',
+                recommendation='Policy guidance is unavailable. Human review is required.',
+            )
+        return apply_policy_priority(classification, policy_result['policy_id'])
+
+    result = process_ticket(ticket, classify_and_apply)
+    result.update(policy_result)
+    if result['status'] == 'classified':
+        if policy_result['policy_id'] == 'POL-003':
+            result['review_triggers'].append(
+                'Verified policy POL-003: immediate escalation is required.')
+        if policy_result['policy_status'] == 'unavailable':
+            result['human_review'] = True
+            result['review_triggers'].append(
+                'Policy guidance unavailable: a person must assess the next action.')
+            if result['priority'] != 'critical':
+                result['routing'] = 'SEND FOR HUMAN REVIEW'
+    return result
 
 
 class Budget:
@@ -185,6 +270,7 @@ def main():
     key = setting('GEMINI_API_KEY')
     model = setting('GEMINI_MODEL', 'gemini-3.5-flash-lite')
     enabled = setting('ENABLE_LIVE_DEMO', 'true').lower() == 'true'
+    policy_enabled = setting('ENABLE_POLICY_RAG', 'false').lower() == 'true'
     if not key:
         st.info('Live analysis is not configured. The app owner must add GEMINI_API_KEY in Streamlit Secrets.')
     if not enabled:
@@ -223,10 +309,15 @@ def main():
             st.session_state.attempts = count + 1
             st.session_state.last_attempt = time.monotonic()
             with st.spinner('Assessing impact and applying safety rules…'):
-                st.session_state.result = process_ticket(
-                    {'subject': subject.strip(), 'body': body.strip()},
-                    lambda ticket: classify_ticket(ticket, key, model),
-                )
+                ticket = {'subject': subject.strip(), 'body': body.strip()}
+                classifier = lambda value: classify_ticket(value, key, model)
+                if policy_enabled:
+                    st.session_state.result = process_ticket_with_policy(
+                        ticket, classifier,
+                        lambda value: run_policy_analysis(value, key, model),
+                    )
+                else:
+                    st.session_state.result = process_ticket(ticket, classifier)
     with right:
         st.subheader('2. Review the recommendation')
         result = st.session_state.get('result')
@@ -242,6 +333,14 @@ def main():
                     st.text('• ' + trigger)
             else:
                 st.caption('No additional trigger detected. This does not certify that the ticket is safe.')
+            if result.get('policy_status'):
+                st.write('**Company policy guidance**')
+                if result.get('policy_id'):
+                    st.text(result['policy_id'] + ' · ' + result['policy_title'])
+                if result.get('recommendation'):
+                    st.text(result['recommendation'])
+                elif result['policy_status'] == 'not_run':
+                    st.caption('Policy guidance was not run because classification failed.')
             st.caption('Result from the last submitted ticket. Submit again after editing the text.')
         else:
             st.info('Choose an example or write a ticket, then select Analyze ticket.')
@@ -249,9 +348,10 @@ def main():
     with st.expander('How decisions and safeguards work'):
         st.write('Five priorities: critical, high, medium, low, very low. Critical always requires immediate human intervention. AI review flags and independent English/German data-loss keyword matches can also require review. Invalid output and service failures always fall back to human review with no invented priority.')
         st.write('Keyword checks are conservative: they can flag negated phrases and miss paraphrases. AI can misclassify or follow malicious ticket instructions despite safeguards. A person must verify consequential decisions.')
+        st.write('When company policy guidance is enabled, each ticket uses up to three Gemini requests: classification, policy verification, and recommendation. Only a verified POL-003 match overrides priority to critical. Unavailable policy guidance requires human review; no matching policy is shown explicitly. Recommendations are AI-generated and must be checked against the displayed policy.')
         st.write('Limits: 15-second session cooldown; 10 attempts per session; shared 6 attempts/minute and 100/rolling day per running process. Failures count. Limits reset on server restart and sessions can be recreated; these are cost-reduction measures, not guaranteed spending caps.')
         st.caption('No ticket history or application-level ticket logging. The current form and result stay in session memory until cleared or the session ends; infrastructure and provider policies still apply.')
-    st.caption(f'English + Deutsch · Model: {model} · Advisory demo')
+    st.caption(f'English + Deutsch · Model: {model} · Policy guidance: {"on" if policy_enabled else "off"} · Advisory demo')
 
 
 if __name__ == '__main__':
