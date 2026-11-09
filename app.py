@@ -103,9 +103,28 @@ def process_ticket(ticket, classifier):
         result = classifier(ticket)
         if not validate_result(result):
             return fallback('Response validation failed: AI output did not match the required schema.', safety)
-    except Exception:
-        # Never display/log raw exceptions, which may contain requests or secrets.
-        return fallback('Processing failed: service unavailable, timeout, quota, blocked output, or unreadable response.', safety)
+    except Exception as error:
+        # Report only allowlisted categories, never raw exception text or requests.
+        code = getattr(error, 'code', None)
+        if type(code) is not int:
+            code = None
+        details = {
+            400: 'Gemini rejected the request (400). Check the API key and model configuration.',
+            401: 'Gemini authentication failed (401). Check the API key in Streamlit Secrets.',
+            403: 'Gemini access denied (403). Check API key permissions and project access.',
+            404: 'Gemini model or endpoint not found (404). Check GEMINI_MODEL in Streamlit Secrets.',
+            429: 'Gemini quota or rate limit reached (429). Check the API project quota and billing.',
+            500: 'Gemini service error (500). Try again later.',
+            503: 'Gemini service unavailable (503). Try again later.',
+            504: 'Gemini request timed out (504). Try again later.',
+        }
+        if code in details:
+            detail = details[code]
+        elif isinstance(error, json.JSONDecodeError):
+            detail = 'Gemini returned an unreadable or empty JSON response.'
+        else:
+            detail = 'Service unavailable, connection failure, timeout, blocked output, or unreadable response.'
+        return fallback('Processing failed: ' + detail, safety)
     triggers = []
     if result['priority'] == 'critical':
         triggers.append('Critical incident: immediate human intervention is required.')
